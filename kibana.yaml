@@ -1,12 +1,22 @@
+
 apiVersion: kibana.k8s.elastic.co/v1
 kind: Kibana
+
 metadata:
   name: kibana
   namespace: elastic
+
 spec:
   version: 9.5.0
-
   count: 1
 
   elasticsearchRef:
     name: elasticsearch
+
+  # Disable ECK-generated HTTPS for Kibana.
+  # This allows the internal ALB to connect to Kibana over HTTP.
+  http:
+    tls:
+      selfSignedCertificate:
+        disabled: true
+
