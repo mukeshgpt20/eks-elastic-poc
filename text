@@ -1,0 +1,1343 @@
+# EKS Elastic Stack with ECK, GP3 EBS, and AWS ALB
+
+This guide deploys an Elastic Stack on Amazon EKS using the Elastic Cloud on Kubernetes (ECK) operator.
+
+## Architecture
+
+```text
+                         Internet
+                            |
+                            | HTTPS :443
+                            v
+                  +---------------------+
+                  |  Internet-facing ALB |
+                  +----------+----------+
+                             |
+                             | HTTPS :5601
+                             v
+                  +---------------------+
+                  |   Kibana Service    |
+                  +----------+----------+
+                             |
+                             v
+                       Kibana Pod
+                             |
+                             |
+                    ECK-managed cluster
+                             |
+              +--------------+--------------+
+              |              |              |
+              v              v              v
+        Elasticsearch  Elasticsearch  Elasticsearch
+             -0             -1             -2
+              |              |              |
+              v              v              v
+           PVC/GP3        PVC/GP3        PVC/GP3
+              |              |              |
+              +--------------+--------------+
+                             |
+                         AWS EBS GP3
+```
+
+---
+
+# 1. Prerequisites
+
+You need:
+
+* AWS account
+* Existing EKS cluster
+* AWS CLI
+* `kubectl`
+* Helm
+* IAM permissions to manage EKS/IAM/EC2/ELB resources
+* EBS CSI driver
+* AWS Load Balancer Controller
+* ECK Operator
+
+Check the tools:
+
+```bash
+aws --version
+kubectl version --client
+helm version
+```
+
+---
+
+# 2. Configure AWS CLI
+
+Check the current identity:
+
+```bash
+aws sts get-caller-identity
+```
+
+Set your cluster details:
+
+```bash
+export CLUSTER_NAME=<your-cluster-name>
+export AWS_REGION=<your-region>
+```
+
+Example:
+
+```bash
+export CLUSTER_NAME=eks-demo
+export AWS_REGION=ap-southeast-2
+```
+
+---
+
+# 3. Configure kubectl for EKS
+
+Run:
+
+```bash
+aws eks update-kubeconfig \
+  --region "$AWS_REGION" \
+  --name "$CLUSTER_NAME"
+```
+
+Verify:
+
+```bash
+kubectl get nodes
+```
+
+Expected:
+
+```text
+NAME                                         STATUS   ROLES
+ip-10-xxx-xxx-xxx.ap-southeast-2.compute... Ready    <none>
+ip-10-xxx-xxx-xxx.ap-southeast-2.compute... Ready    <none>
+```
+
+---
+
+# 4. Install / verify EBS CSI Driver
+
+The EBS CSI driver is required for Elasticsearch persistent storage using EBS.
+
+Check:
+
+```bash
+aws eks describe-addon \
+  --cluster-name "$CLUSTER_NAME" \
+  --addon-name aws-ebs-csi-driver \
+  --region "$AWS_REGION"
+```
+
+If it is not installed:
+
+```bash
+aws eks create-addon \
+  --cluster-name "$CLUSTER_NAME" \
+  --addon-name aws-ebs-csi-driver \
+  --region "$AWS_REGION"
+```
+
+Verify:
+
+```bash
+kubectl get pods -n kube-system | grep ebs-csi
+```
+
+You should see controller and node pods.
+
+---
+
+# 5. Create GP3 StorageClass
+
+We do not want Elasticsearch to use the old `gp2` StorageClass.
+
+Create:
+
+```bash
+vi gp3-storageclass.yaml
+```
+
+Contents:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+
+metadata:
+  name: gp3
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+
+provisioner: ebs.csi.aws.com
+
+volumeBindingMode: WaitForFirstConsumer
+
+allowVolumeExpansion: true
+
+parameters:
+  type: gp3
+  encrypted: "true"
+  fsType: ext4
+```
+
+Apply:
+
+```bash
+kubectl apply -f gp3-storageclass.yaml
+```
+
+Verify:
+
+```bash
+kubectl get storageclass
+```
+
+Expected:
+
+```text
+NAME            PROVISIONER             RECLAIMPOLICY
+gp3 (default)   ebs.csi.aws.com         Delete
+gp2             kubernetes.io/aws-ebs   Delete
+```
+
+The important setting is:
+
+```yaml
+parameters:
+  type: gp3
+```
+
+---
+
+# 6. Install ECK Operator
+
+Add the Elastic Helm repository:
+
+```bash
+helm repo add elastic https://helm.elastic.co
+```
+
+Update:
+
+```bash
+helm repo update
+```
+
+Check the chart:
+
+```bash
+helm search repo elastic/eck-operator
+```
+
+Install ECK:
+
+```bash
+helm install elastic-operator \
+  elastic/eck-operator \
+  -n elastic-system \
+  --create-namespace
+```
+
+Verify:
+
+```bash
+kubectl get pods -n elastic-system
+```
+
+Expected:
+
+```text
+NAME                READY   STATUS
+elastic-operator-0  1/1     Running
+```
+
+Check Helm:
+
+```bash
+helm list -n elastic-system
+```
+
+---
+
+# 7. Create Elastic namespace
+
+Create a separate namespace for Elasticsearch and Kibana:
+
+```bash
+kubectl create namespace elastic
+```
+
+Verify:
+
+```bash
+kubectl get namespaces
+```
+
+---
+
+# 8. Deploy Elasticsearch
+
+Create:
+
+```bash
+vi elasticsearch.yaml
+```
+
+Example 3-node Elasticsearch cluster:
+
+```yaml
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+
+metadata:
+  name: elasticsearch
+  namespace: elastic
+
+spec:
+
+  version: 9.2.0
+
+  nodeSets:
+
+    - name: default
+
+      count: 3
+
+      config:
+        node.roles:
+          - master
+          - data
+          - ingest
+
+      volumeClaimTemplates:
+
+        - metadata:
+            name: elasticsearch-data
+
+          spec:
+
+            accessModes:
+              - ReadWriteOnce
+
+            storageClassName: gp3
+
+            resources:
+              requests:
+                storage: 100Gi
+```
+
+Apply:
+
+```bash
+kubectl apply -f elasticsearch.yaml
+```
+
+---
+
+# 9. Check Elasticsearch
+
+Check the Elasticsearch resource:
+
+```bash
+kubectl get elasticsearch -n elastic
+```
+
+Check pods:
+
+```bash
+kubectl get pods -n elastic
+```
+
+Expected:
+
+```text
+elasticsearch-es-default-0   1/1   Running
+elasticsearch-es-default-1   1/1   Running
+elasticsearch-es-default-2   1/1   Running
+```
+
+Check health:
+
+```bash
+kubectl get elasticsearch -n elastic
+```
+
+Eventually:
+
+```text
+NAME            HEALTH   NODES   VERSION
+elasticsearch   green    3       9.2.0
+```
+
+---
+
+# 10. Verify Elasticsearch PVCs
+
+Check:
+
+```bash
+kubectl get pvc -n elastic
+```
+
+Expected:
+
+```text
+NAME                                      STATUS   VOLUME
+elasticsearch-data-elasticsearch-0        Bound    pvc-xxxx
+elasticsearch-data-elasticsearch-1        Bound    pvc-yyyy
+elasticsearch-data-elasticsearch-2        Bound    pvc-zzzz
+```
+
+Check StorageClass:
+
+```bash
+kubectl get pvc -n elastic \
+  -o custom-columns=NAME:.metadata.name,STATUS:.status.phase,STORAGECLASS:.spec.storageClassName
+```
+
+Expected:
+
+```text
+NAME                                      STATUS   STORAGECLASS
+elasticsearch-data-...-0                  Bound    gp3
+elasticsearch-data-...-1                  Bound    gp3
+elasticsearch-data-...-2                  Bound    gp3
+```
+
+The PVCs must show:
+
+```text
+gp3
+```
+
+not:
+
+```text
+gp2
+```
+
+---
+
+# 11. Verify EBS volumes
+
+Find the PVs:
+
+```bash
+kubectl get pv
+```
+
+Describe one:
+
+```bash
+kubectl describe pv <PV_NAME>
+```
+
+The volume should be provisioned by:
+
+```text
+ebs.csi.aws.com
+```
+
+The underlying AWS EBS volume should be type:
+
+```text
+gp3
+```
+
+---
+
+# 12. Get Elasticsearch password
+
+ECK creates the `elastic` user automatically.
+
+Get the password:
+
+```bash
+kubectl get secret elasticsearch-es-elastic-user \
+  -n elastic \
+  -o go-template='{{.data.elastic | base64decode}}'
+```
+
+Save the password temporarily.
+
+---
+
+# 13. Test Elasticsearch
+
+Port-forward Elasticsearch:
+
+```bash
+kubectl port-forward \
+  -n elastic \
+  service/elasticsearch-es-http \
+  9200:9200
+```
+
+From another terminal:
+
+```bash
+curl -k \
+  -u "elastic:<PASSWORD>" \
+  https://localhost:9200
+```
+
+Check cluster health:
+
+```bash
+curl -k \
+  -u "elastic:<PASSWORD>" \
+  https://localhost:9200/_cluster/health
+```
+
+Expected:
+
+```json
+{
+  "status": "green"
+}
+```
+
+---
+
+# 14. Deploy Kibana
+
+Create:
+
+```bash
+vi kibana.yaml
+```
+
+Contents:
+
+```yaml
+apiVersion: kibana.k8s.elastic.co/v1
+kind: Kibana
+
+metadata:
+  name: kibana
+  namespace: elastic
+
+spec:
+
+  version: 9.2.0
+
+  count: 1
+
+  elasticsearchRef:
+    name: elasticsearch
+```
+
+Apply:
+
+```bash
+kubectl apply -f kibana.yaml
+```
+
+---
+
+# 15. Verify Kibana
+
+Run:
+
+```bash
+kubectl get kibana -n elastic
+```
+
+Then:
+
+```bash
+kubectl get pods -n elastic
+```
+
+Expected:
+
+```text
+elasticsearch-es-default-0   1/1   Running
+elasticsearch-es-default-1   1/1   Running
+elasticsearch-es-default-2   1/1   Running
+kibana-kibana-xxxxxxxxxx     1/1   Running
+```
+
+Check services:
+
+```bash
+kubectl get svc -n elastic
+```
+
+You should have:
+
+```text
+elasticsearch-es-http
+kibana-kb-http
+```
+
+Kibana normally listens on:
+
+```text
+5601
+```
+
+and ECK configures HTTPS.
+
+---
+
+# 16. Test Kibana locally
+
+Before configuring ALB, verify Kibana directly.
+
+Run:
+
+```bash
+kubectl port-forward \
+  -n elastic \
+  service/kibana-kb-http \
+  5601:5601
+```
+
+Open:
+
+```text
+https://localhost:5601
+```
+
+Login:
+
+```text
+Username: elastic
+Password: <password>
+```
+
+If this works, ECK/Kibana is healthy.
+
+---
+
+# 17. Install AWS Load Balancer Controller
+
+The AWS Load Balancer Controller is required to create an AWS Application Load Balancer from a Kubernetes `Ingress`.
+
+First check:
+
+```bash
+kubectl get deployment \
+  aws-load-balancer-controller \
+  -n kube-system
+```
+
+If it doesn't exist, install it.
+
+---
+
+# 18. Install EKS Pod Identity Agent
+
+Check:
+
+```bash
+aws eks describe-addon \
+  --cluster-name "$CLUSTER_NAME" \
+  --addon-name eks-pod-identity-agent \
+  --region "$AWS_REGION"
+```
+
+If required:
+
+```bash
+aws eks create-addon \
+  --cluster-name "$CLUSTER_NAME" \
+  --addon-name eks-pod-identity-agent \
+  --region "$AWS_REGION"
+```
+
+Verify:
+
+```bash
+kubectl get pods -n kube-system | grep eks-pod-identity
+```
+
+---
+
+# 19. Create AWS Load Balancer Controller IAM Policy
+
+Download the official policy:
+
+```bash
+curl -O \
+  https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json
+```
+
+Create the IAM policy:
+
+```bash
+aws iam create-policy \
+  --policy-name AWSLoadBalancerControllerIAMPolicy \
+  --policy-document file://iam_policy.json
+```
+
+If the policy already exists, use the existing policy ARN.
+
+---
+
+# 20. Create Controller ServiceAccount
+
+Create:
+
+```bash
+kubectl create serviceaccount \
+  aws-load-balancer-controller \
+  -n kube-system
+```
+
+The controller should use a dedicated IAM role rather than relying on the EKS node role.
+
+The IAM role needs:
+
+```text
+AWSLoadBalancerControllerIAMPolicy
+```
+
+attached.
+
+---
+
+# 21. Install AWS Load Balancer Controller with Helm
+
+Add the repository:
+
+```bash
+helm repo add eks https://aws.github.io/eks-charts
+```
+
+Update:
+
+```bash
+helm repo update
+```
+
+Get the VPC ID:
+
+```bash
+export VPC_ID=$(aws eks describe-cluster \
+  --name "$CLUSTER_NAME" \
+  --region "$AWS_REGION" \
+  --query 'cluster.resourcesVpcConfig.vpcId' \
+  --output text)
+```
+
+Verify:
+
+```bash
+echo "$VPC_ID"
+```
+
+Install:
+
+```bash
+helm install aws-load-balancer-controller \
+  eks/aws-load-balancer-controller \
+  -n kube-system \
+  --set clusterName="$CLUSTER_NAME" \
+  --set region="$AWS_REGION" \
+  --set vpcId="$VPC_ID" \
+  --set serviceAccount.create=false \
+  --set serviceAccount.name=aws-load-balancer-controller
+```
+
+Check:
+
+```bash
+kubectl get pods -n kube-system | grep aws-load-balancer
+```
+
+Expected:
+
+```text
+aws-load-balancer-controller-xxxxx   1/1   Running
+```
+
+---
+
+# 22. Verify Controller Permissions
+
+If you see an error such as:
+
+```text
+AccessDenied:
+elasticloadbalancing:DescribeLoadBalancers
+```
+
+the controller does not have the required IAM permissions.
+
+Do not simply add one ELB permission at a time.
+
+The controller requires its complete IAM policy.
+
+Check the controller logs:
+
+```bash
+kubectl logs \
+  -n kube-system \
+  deployment/aws-load-balancer-controller \
+  --tail=100
+```
+
+---
+
+# 23. Create Internet-Facing ALB for Kibana
+
+For production, HTTPS is recommended.
+
+The following configuration creates:
+
+```text
+Internet
+   |
+   | HTTP :80
+   v
+ALB
+   |
+   | HTTPS :5601
+   v
+Kibana
+```
+
+However, Kibana requires a secure connection for login. Therefore, the recommended configuration is:
+
+```text
+Internet
+   |
+   | HTTP :80
+   v
+ALB
+   |
+   | redirect
+   v
+HTTPS :443
+   |
+   | HTTPS :5601
+   v
+Kibana
+```
+
+---
+
+# 24. HTTPS ALB Requirements
+
+You need:
+
+* A DNS name
+* ACM certificate
+* Certificate ARN
+* DNS record pointing to the ALB
+
+Example:
+
+```text
+kibana.example.com
+```
+
+The ACM certificate should cover:
+
+```text
+kibana.example.com
+```
+
+---
+
+# 25. Kibana ALB Ingress
+
+Create:
+
+```bash
+vi kibana-alb.yaml
+```
+
+Use:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+
+metadata:
+  name: kibana-alb
+  namespace: elastic
+
+  annotations:
+
+    # Internet-facing ALB
+    alb.ingress.kubernetes.io/scheme: internet-facing
+
+    # Route directly to pod IPs
+    alb.ingress.kubernetes.io/target-type: ip
+
+    # HTTP and HTTPS listeners
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+
+    # Redirect HTTP to HTTPS
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+
+    # ACM certificate
+    alb.ingress.kubernetes.io/certificate-arn: <ACM_CERTIFICATE_ARN>
+
+    # ALB -> Kibana
+    alb.ingress.kubernetes.io/backend-protocol: HTTPS
+
+    # Health check
+    alb.ingress.kubernetes.io/healthcheck-protocol: HTTPS
+    alb.ingress.kubernetes.io/healthcheck-port: "5601"
+    alb.ingress.kubernetes.io/healthcheck-path: /login
+
+spec:
+
+  ingressClassName: alb
+
+  rules:
+
+    - host: kibana.example.com
+
+      http:
+
+        paths:
+
+          - path: /
+            pathType: Prefix
+
+            backend:
+
+              service:
+                name: kibana-kb-http
+                port:
+                  number: 5601
+```
+
+Apply:
+
+```bash
+kubectl apply -f kibana-alb.yaml
+```
+
+---
+
+# 26. Check ALB provisioning
+
+Run:
+
+```bash
+kubectl get ingress -n elastic
+```
+
+Initially:
+
+```text
+NAME         CLASS   HOSTS   ADDRESS   PORTS
+kibana-alb   alb     *                 80,443
+```
+
+Wait several minutes.
+
+Then:
+
+```bash
+kubectl get ingress kibana-alb -n elastic
+```
+
+Eventually:
+
+```text
+NAME         CLASS   HOSTS                  ADDRESS
+kibana-alb   alb     kibana.example.com     k8s-elastic-xxxxx.elb.amazonaws.com
+```
+
+---
+
+# 27. Get ALB DNS name
+
+```bash
+kubectl get ingress kibana-alb \
+  -n elastic \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+```
+
+Example:
+
+```text
+k8s-elastic-kibanaal-xxxx.ap-southeast-2.elb.amazonaws.com
+```
+
+---
+
+# 28. DNS Configuration
+
+Create a DNS record:
+
+```text
+kibana.example.com
+```
+
+pointing to the ALB.
+
+For Route 53, create an Alias record pointing to the ALB.
+
+Then access:
+
+```text
+https://kibana.example.com
+```
+
+---
+
+# 29. HTTP to HTTPS
+
+If a user enters:
+
+```text
+http://kibana.example.com
+```
+
+the ALB should redirect to:
+
+```text
+https://kibana.example.com
+```
+
+This is important because Kibana requires a secure connection for authentication.
+
+Do not expose Kibana login credentials over plain HTTP.
+
+---
+
+# 30. Troubleshooting ALB
+
+If:
+
+```bash
+kubectl get ingress -n elastic
+```
+
+shows:
+
+```text
+ADDRESS
+```
+
+empty, check:
+
+```bash
+kubectl describe ingress kibana-alb -n elastic
+```
+
+Look at:
+
+```text
+Events:
+```
+
+---
+
+## AccessDenied error
+
+Example:
+
+```text
+AccessDenied:
+elasticloadbalancing:DescribeLoadBalancers
+```
+
+This means the AWS Load Balancer Controller IAM permissions are incorrect.
+
+Check:
+
+```bash
+kubectl logs \
+  -n kube-system \
+  deployment/aws-load-balancer-controller \
+  --tail=100
+```
+
+Verify that the controller has its dedicated IAM role/policy.
+
+---
+
+# 31. Check Kibana service
+
+```bash
+kubectl get svc kibana-kb-http -n elastic
+```
+
+Expected:
+
+```text
+NAME             TYPE        CLUSTER-IP
+kibana-kb-http   ClusterIP   10.x.x.x
+```
+
+Check endpoints:
+
+```bash
+kubectl get endpoints kibana-kb-http -n elastic
+```
+
+There should be Kibana pod IP addresses.
+
+---
+
+# 32. Check ALB target health
+
+Find target groups:
+
+```bash
+aws elbv2 describe-target-groups \
+  --region "$AWS_REGION"
+```
+
+Then:
+
+```bash
+aws elbv2 describe-target-health \
+  --region "$AWS_REGION" \
+  --target-group-arn <TARGET_GROUP_ARN>
+```
+
+Targets should show:
+
+```text
+State: healthy
+```
+
+---
+
+# 33. Check Kubernetes Events
+
+```bash
+kubectl get events \
+  -n elastic \
+  --sort-by=.lastTimestamp
+```
+
+This is useful for identifying:
+
+* ALB provisioning errors
+* IAM errors
+* Health check errors
+* Service errors
+* Pod scheduling problems
+
+---
+
+# 34. Check Elasticsearch
+
+```bash
+kubectl get elasticsearch -n elastic
+```
+
+Expected:
+
+```text
+NAME            HEALTH   NODES
+elasticsearch   green    3
+```
+
+---
+
+# 35. Check Kibana
+
+```bash
+kubectl get kibana -n elastic
+```
+
+Expected:
+
+```text
+NAME      HEALTH   NODES
+kibana    green    1
+```
+
+---
+
+# 36. Final Validation
+
+Run:
+
+```bash
+kubectl get pods -n elastic
+```
+
+Expected:
+
+```text
+elasticsearch-es-default-0   1/1   Running
+elasticsearch-es-default-1   1/1   Running
+elasticsearch-es-default-2   1/1   Running
+kibana-kibana-xxxxxxxxxx     1/1   Running
+```
+
+Check storage:
+
+```bash
+kubectl get pvc -n elastic
+```
+
+Expected StorageClass:
+
+```text
+gp3
+```
+
+Check ECK:
+
+```bash
+kubectl get pods -n elastic-system
+```
+
+Check ALB:
+
+```bash
+kubectl get ingress -n elastic
+```
+
+Check Kubernetes nodes:
+
+```bash
+kubectl get nodes
+```
+
+---
+
+# 37. Useful Commands
+
+## Elasticsearch
+
+```bash
+kubectl get elasticsearch -n elastic
+```
+
+```bash
+kubectl describe elasticsearch elasticsearch -n elastic
+```
+
+## Kibana
+
+```bash
+kubectl get kibana -n elastic
+```
+
+```bash
+kubectl describe kibana kibana -n elastic
+```
+
+## Pods
+
+```bash
+kubectl get pods -n elastic -o wide
+```
+
+## PVCs
+
+```bash
+kubectl get pvc -n elastic
+```
+
+## StorageClass
+
+```bash
+kubectl get storageclass
+```
+
+## Services
+
+```bash
+kubectl get svc -n elastic
+```
+
+## Ingress
+
+```bash
+kubectl get ingress -n elastic
+```
+
+## ECK Operator
+
+```bash
+kubectl get pods -n elastic-system
+```
+
+## Load Balancer Controller
+
+```bash
+kubectl get pods -n kube-system | grep aws-load-balancer
+```
+
+---
+
+# 38. Deployment Summary
+
+The final environment should look like:
+
+```text
+EKS Cluster
+│
+├── kube-system
+│   ├── EBS CSI Driver
+│   ├── EKS Pod Identity Agent
+│   └── AWS Load Balancer Controller
+│
+├── elastic-system
+│   └── ECK Operator
+│
+└── elastic
+    │
+    ├── Elasticsearch
+    │   ├── Pod 0
+    │   │    └── PVC → GP3 EBS
+    │   │
+    │   ├── Pod 1
+    │   │    └── PVC → GP3 EBS
+    │   │
+    │   └── Pod 2
+    │        └── PVC → GP3 EBS
+    │
+    ├── Kibana
+    │
+    └── Ingress
+         │
+         ▼
+    Internet-facing ALB
+         │
+         ├── HTTP :80
+         │       │
+         │       └── Redirect
+         │
+         └── HTTPS :443
+                  │
+                  ▼
+             Kibana HTTPS :5601
+```
+
+---
+
+# 39. Recommended Production Improvements
+
+The configuration above is suitable as a lab starting point.
+
+For production, consider adding:
+
+* HTTPS with ACM
+* Route 53 DNS
+* ALB security groups restricted to trusted CIDRs
+* AWS WAF
+* Separate Elasticsearch master and data roles
+* Dedicated data nodes
+* Elasticsearch resource requests/limits
+* Pod anti-affinity
+* Availability-zone awareness
+* EBS GP3 IOPS/throughput tuning
+* Snapshot repository
+* S3 snapshot storage
+* Kibana authentication/SSO
+* Elastic Agent/Fleet
+* Monitoring
+* Alerting
+* Backup and disaster recovery
+
+Do not expose Kibana's login endpoint directly to the public Internet without appropriate TLS and access controls.
+
+```
+```
