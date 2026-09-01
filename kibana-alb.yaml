@@ -1,0 +1,38 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kibana-alb
+  namespace: elastic
+
+  annotations:
+    # Internet-facing ALB
+    alb.ingress.kubernetes.io/scheme: internet-facing
+
+    # Send traffic directly to pod IPs
+    alb.ingress.kubernetes.io/target-type: ip
+
+    # ALB listens on HTTP port 80
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+
+    # ALB -> Kibana uses HTTPS
+    alb.ingress.kubernetes.io/backend-protocol: HTTPS
+
+    # Health check
+    alb.ingress.kubernetes.io/healthcheck-protocol: HTTPS
+    alb.ingress.kubernetes.io/healthcheck-port: "5601"
+    alb.ingress.kubernetes.io/healthcheck-path: /login
+
+spec:
+  ingressClassName: alb
+
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+
+            backend:
+              service:
+                name: kibana-kb-http
+                port:
+                  number: 5601
